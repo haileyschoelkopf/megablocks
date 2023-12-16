@@ -37,41 +37,42 @@ class LearnedSoftRouter(torch.nn.Module):
         # NOTE: This weight matrix is not parallelized with expert model
         # parallelism. Each device needs the entire router weight matrix
         # so that it can route its batch of data correctly.
-        self.layer = torch.nn.Linear( # TODO: resize this appropriately
+        self.layer = torch.nn.Linear(
             args.hidden_size,
-            args.moe_num_experts,
+            args.moe_num_experts * args.moe_num_slots_per_expert, # TODO: add this arg to the arguments.py file
             bias=False,
-            dtype=common.dtype(args),
+            dtype=common.dtype(args), # TODO: why are routers not in fp32?
             device=args.device)
         args.init_method(self.layer.weight)
 
-    def jitter(self, x): # TODO: adapt jitter to soft routing (maybe no change)
+    def jitter(self, x): # TODO: re-check jitter (probably no change needed) adapt jitter to soft routing
         low = 1.0 - self.args.moe_jitter_eps
         high = 1.0 + self.args.moe_jitter_eps
         noise = torch.rand(x.size(), dtype=x.dtype, device=x.device)
         return low + noise * (high - low)
 
-    def _top_k(self, scores): # TODO: ditch this?
-        if self.args.moe_top_k == 1:
-            return scores.max(dim=-1)
-        return torch.topk(scores, self.args.moe_top_k, dim=-1)
-
-
     def forward(self, x): # TODO: change return signature of forward() to return combine + dispatch weights
         if self.training and self.args.moe_jitter_eps is not None:
             x = x * self.jitter(x)
 
-        scores = self.layer(x.view(-1, x.shape[-1])).softmax(dim=-1)
-        expert_weights, expert_indices = self._top_k(scores)
-        if self.args.moe_normalize_expert_weights:
-            expert_weights /= torch.norm(
-                expert_weights, p=self.args.moe_normalize_expert_weights,dim=-1, keepdim=True)
+        sl, bs, hs = x.size()
+        # get router scores 
+        # x: [sl, bs, hs] -> view as [sl * bs, hs]
+        # scores: [sl * bs, n_experts * n_slots_per_expert]
+        # (as opposed to [sl * bs, n_experts] in typical SparseMoE case)
+        scores = self.layer(x.view(-1, x.shape[-1]).view(sl, bs, -1) # TODO: get rid of this view() ?
 
+        # combine weights: softmax over slot outputs
+        combine_weights = scores.softmax(dim=2)
+
+        dispatch_weights = scores.softmax(dim=0) # softmax over tokens within sequence
+                       
         expert_indices = (
-            _uniform_expert_assignment(expert_indices, self.args.moe_num_experts)
+            _uniform_expert_assignment(expert_indices, self.args.moe_num_experts) 
+            # TODO: add a check earlier on that returns identity for combine/dispatch weights optionally
             if self.args.uniform_expert_assignment else expert_indices
         )
-        return scores, expert_weights, expert_indices
+        return scores, combine_weights, dispatch_weights, expert_indices # TODO: don't return or calculate expert_indices?
 
 
 class ParallelSoftMLP(moe.ParallelMLP):
