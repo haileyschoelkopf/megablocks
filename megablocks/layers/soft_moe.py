@@ -1,6 +1,5 @@
 from megablocks.layers import common
 from megablocks.layers import mpu
-from megablocks.layers import router
 from megablocks.layers import mlp
 from megablocks.layers import moe
 from megablocks.layers.all_to_all import all_to_all
@@ -8,6 +7,71 @@ from megablocks.layers.arguments import Arguments
 import megablocks.ops as ops
 import numpy as np
 import torch
+
+
+# TODO: add a similar identity fn router for soft MoE
+
+# NOTE: To enable end-to-end benchmarking without convergence we
+# support a flag to force the router to assign tokens uniformly
+# across the experts. We do this with a custom autograd operation
+# so that PyTorch still executes the full set of router operation.
+# class _UniformExpertAssignment(torch.autograd.Function):
+
+
+#     @staticmethod
+#     def forward(ctx, x, num_experts):
+#         out = torch.arange(x.numel(), dtype=x.dtype, device=x.device)
+#         out = torch.remainder(out, num_experts)
+#         return out.view(x.shape)
+# _uniform_expert_assignment = _UniformExpertAssignment.apply
+
+
+class LearnedSoftRouter(torch.nn.Module):
+
+    def __init__(self, args : Arguments):
+        super().__init__()
+        self.args = args
+
+        # Learned soft MoE router parameters.
+        #
+        # NOTE: This weight matrix is not parallelized with expert model
+        # parallelism. Each device needs the entire router weight matrix
+        # so that it can route its batch of data correctly.
+        self.layer = torch.nn.Linear( # TODO: resize this appropriately
+            args.hidden_size,
+            args.moe_num_experts,
+            bias=False,
+            dtype=common.dtype(args),
+            device=args.device)
+        args.init_method(self.layer.weight)
+
+    def jitter(self, x): # TODO: adapt jitter to soft routing (maybe no change)
+        low = 1.0 - self.args.moe_jitter_eps
+        high = 1.0 + self.args.moe_jitter_eps
+        noise = torch.rand(x.size(), dtype=x.dtype, device=x.device)
+        return low + noise * (high - low)
+
+    def _top_k(self, scores): # TODO: ditch this?
+        if self.args.moe_top_k == 1:
+            return scores.max(dim=-1)
+        return torch.topk(scores, self.args.moe_top_k, dim=-1)
+
+
+    def forward(self, x): # TODO: change return signature of forward() to return combine + dispatch weights
+        if self.training and self.args.moe_jitter_eps is not None:
+            x = x * self.jitter(x)
+
+        scores = self.layer(x.view(-1, x.shape[-1])).softmax(dim=-1)
+        expert_weights, expert_indices = self._top_k(scores)
+        if self.args.moe_normalize_expert_weights:
+            expert_weights /= torch.norm(
+                expert_weights, p=self.args.moe_normalize_expert_weights,dim=-1, keepdim=True)
+
+        expert_indices = (
+            _uniform_expert_assignment(expert_indices, self.args.moe_num_experts)
+            if self.args.uniform_expert_assignment else expert_indices
+        )
+        return scores, expert_weights, expert_indices
 
 
 class ParallelSoftMLP(moe.ParallelMLP):
