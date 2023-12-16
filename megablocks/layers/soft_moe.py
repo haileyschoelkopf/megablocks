@@ -15,15 +15,17 @@ import torch
 # support a flag to force the router to assign tokens uniformly
 # across the experts. We do this with a custom autograd operation
 # so that PyTorch still executes the full set of router operation.
-# class _UniformExpertAssignment(torch.autograd.Function):
+
+# (hailey): in Soft MoE we assume a uniform unchanging expert assignment of slots to experts. 
+class _UniformExpertAssignment(torch.autograd.Function):
 
 
-#     @staticmethod
-#     def forward(ctx, x, num_experts):
-#         out = torch.arange(x.numel(), dtype=x.dtype, device=x.device)
-#         out = torch.remainder(out, num_experts)
-#         return out.view(x.shape)
-# _uniform_expert_assignment = _UniformExpertAssignment.apply
+    @staticmethod
+    def forward(ctx, x, num_experts):
+        out = torch.arange(x.numel(), dtype=x.dtype, device=x.device)
+        out = torch.remainder(out, num_experts)
+        return out.view(x.shape)
+_uniform_expert_assignment = _UniformExpertAssignment.apply
 
 
 class LearnedSoftRouter(torch.nn.Module):
@@ -62,17 +64,17 @@ class LearnedSoftRouter(torch.nn.Module):
         # (as opposed to [sl * bs, n_experts] in typical SparseMoE case)
         scores = self.layer(x.view(-1, x.shape[-1]).view(sl, bs, -1) # TODO: get rid of this view() ?
 
-        # combine weights: softmax over slot outputs
+        # combine weights: softmax over output *slots*
         combine_weights = scores.softmax(dim=2)
 
-        dispatch_weights = scores.softmax(dim=0) # softmax over tokens within sequence
+        # dispatch weights: softmax over input *tokens* within a sequence
+        dispatch_weights = scores.softmax(dim=0)
                        
-        expert_indices = (
+        expert_indices = ( #  
             _uniform_expert_assignment(expert_indices, self.args.moe_num_experts) 
-            # TODO: add a check earlier on that returns identity for combine/dispatch weights optionally
-            if self.args.uniform_expert_assignment else expert_indices
+            # TODO: add a check earlier on that returns identity for combine/dispatch weights optionally, for testing purposes
         )
-        return scores, combine_weights, dispatch_weights, expert_indices # TODO: don't return or calculate expert_indices?
+        return scores, combine_weights, dispatch_weights, expert_indices
 
 
 class ParallelSoftMLP(moe.ParallelMLP):
@@ -85,7 +87,9 @@ class ParallelSoftMLP(moe.ParallelMLP):
         # owned by this rank.
         world_size = mpu.get_expert_parallel_world_size(args)
         self.num_experts = args.moe_num_experts
-        self.top_k = self.args.moe_top_k # TODO: express total slots in terms of this?
+        self.top_k = self.args.moe_top_k # TODO: express total slots in terms of this? or use args.moe_num_slots_per_expert?
+
+        assert args.moe_capacity_factor == 1, "non-1.0 capacity factors disallowed for Soft MoE"
 
         # Calculate the number of bits needed to represent the expert indices
         # so that we can pass it to radix sort.
@@ -111,13 +115,13 @@ class ParallelSoftMLP(moe.ParallelMLP):
             args.moe_expert_model_parallelism else
             self.forward_once)
 
-    def expert_capacity(self, tokens): # TODO: capacity factor not relevant for Soft MoE
+    def expert_capacity(self, tokens): # TODO: capacity factor not relevant for Soft MoE. should fix this to be num_slots_per_expert exactly
         world_size = mpu.get_expert_parallel_world_size(self.args)
         tokens_per_expert = (
             self.top_k * tokens * world_size / self.num_experts)
         return int(self.args.moe_capacity_factor * tokens_per_expert)
 
-    def load_balancing_loss(self, tokens_per_expert, expert_scores): # TODO: analogue to load balancing loss in Soft MoE? check that jitter still valid in this case?
+    def load_balancing_loss(self, tokens_per_expert, expert_scores): # TODO: any good analogue to load balancing loss in Soft MoE?
         """Calculate the load balancing loss contribution."""
         assert len(expert_scores.size()) == 2
         tokens, num_experts = expert_scores.size()
@@ -420,7 +424,7 @@ class SoftMoE(moe.MoE):
         super(SoftMoE, self).__init__()
 
         # Token router.
-        self.router = router.LearnedRouter(args) # TODO: use a specialized router. Should compute scores over *slots* and softmax appropriate dims to give combine or dispatch weights
+        self.router = LearnedSoftRouter(args) # TODO: check router logic is correct.
 
         # Expert computation helper.
         self.experts = ParallelSoftMLP(args)
@@ -430,8 +434,10 @@ class SoftMoE(moe.MoE):
         # do it before we permute the tokens to save bandwidth.
         x = common.cast_if_autocast_enabled(x)
 
+        # TODO: is it safe to do combine/dispatch on each rank locally? then do forward() logic as is typical?
+        
         # Compute the expert scores and assignments.
-        scores, expert_weights, top_experts = self.router(x)
+        scores, expert_weights, top_experts = self.router(x) # TODO: return from my implemented router not yet matching this
 
         # Slots = linear combination of tokens, given by dispatch weights
         x = self.dispatch(x, scores)
