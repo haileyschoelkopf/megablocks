@@ -434,7 +434,8 @@ class SoftMoE(moe.MoE):
 
         # x: [sl, bs, hs]
         # TODO: currently assumes same shape returned as input. we will need to handle total_slots < seqlen case
-        input_slots = x * dispatch_weights 
+        input_slots = torch.einsum('n b h, n b s -> s b h', x, dispatch_weights) # n = seqlen, b = batchsize, h = hiddensize, s = totalslots
+        assert input_slots.shape == x.shape # temporary assert to check output shape. once general total slot count supported should not hold
 
         # input_slots: [sl, bs, hs]
         return input_slots
@@ -443,8 +444,10 @@ class SoftMoE(moe.MoE):
         # takes in outputs from slots and returns a linear combination of slot outputs for each *token*.
         
         # x: [total_slots, bs, hs] # TODO: for now we assume total_slots = sl
-        output_tokens = x * combine_weights
-        
+        # combine_weights: [sl, bs, n_experts * n_slots_per_expert]
+        output_tokens = torch.einsum("s b h, n b s -> n b h", x, combine_weights) # n = seqlen, b = batchsize, h = hiddensize, s = totalslots
+
+        assert output_tokens.shape == x.shape # assert to check output shape
         # output_tokens: [sl, bs, hs]
         return output_tokens
 
