@@ -23,6 +23,7 @@ class Arguments:
     # MoE arguments.
     moe_num_experts : int = 1
     moe_top_k : int = 1
+    moe_num_slots_per_expert: int = -1
     moe_capacity_factor : int = 1
     moe_normalize_expert_weights: Optional[Union[int, float]] = None
     moe_loss_weight : float = 0.1
