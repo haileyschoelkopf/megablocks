@@ -65,10 +65,10 @@ class LearnedSoftRouter(torch.nn.Module):
         scores = self.layer(x.view(-1, x.shape[-1]).view(sl, bs, -1) # TODO: get rid of this view() ?
 
         # combine weights: softmax over output *slots*
-        combine_weights = scores.softmax(dim=2)
+        combine_weights = scores.softmax(dim=2) # combine_weights: [sl, bs, n_experts * n_slots_per_expert]
 
         # dispatch weights: softmax over input *tokens* within a sequence
-        dispatch_weights = scores.softmax(dim=0)
+        dispatch_weights = scores.softmax(dim=0) # dispatch_weights: [sl, bs, n_experts * n_slots_per_expert]
                        
         expert_indices = ( #  
             _uniform_expert_assignment(expert_indices, self.args.moe_num_experts) 
@@ -121,18 +121,18 @@ class ParallelSoftMLP(moe.ParallelMLP):
             self.top_k * tokens * world_size / self.num_experts)
         return int(self.args.moe_capacity_factor * tokens_per_expert)
 
-    def load_balancing_loss(self, tokens_per_expert, expert_scores): # TODO: any good analogue to load balancing loss in Soft MoE?
-        """Calculate the load balancing loss contribution."""
-        assert len(expert_scores.size()) == 2
-        tokens, num_experts = expert_scores.size()
-        assert num_experts == self.num_experts
-        assert len(tokens_per_expert.size()) == 1
-        num_experts, = tokens_per_expert.size()
-        assert num_experts == self.num_experts
-        scale = self.num_experts / (tokens * self.top_k)
-        return scale * torch.dot(
-            tokens_per_expert.to(expert_scores.dtype),
-            expert_scores.mean(dim=0))
+    # def load_balancing_loss(self, tokens_per_expert, expert_scores): # TODO: any good analogue to load balancing loss in Soft MoE?
+    #     """Calculate the load balancing loss contribution."""
+    #     assert len(expert_scores.size()) == 2
+    #     tokens, num_experts = expert_scores.size()
+    #     assert num_experts == self.num_experts
+    #     assert len(tokens_per_expert.size()) == 1
+    #     num_experts, = tokens_per_expert.size()
+    #     assert num_experts == self.num_experts
+    #     scale = self.num_experts / (tokens * self.top_k)
+    #     return scale * torch.dot(
+    #         tokens_per_expert.to(expert_scores.dtype),
+    #         expert_scores.mean(dim=0))
 
     def indices_and_bins(self, top_expert):
         # Sort the expert ids to produce the scatter/gather
@@ -409,7 +409,7 @@ class ParallelSoftMLP(moe.ParallelMLP):
         # Compute the experts.
         x, tokens_per_expert = self.forward_fn(
             x, expert_weights, top_experts)
-        save_load_balancing_loss((tokens_per_expert, scores))
+        # save_load_balancing_loss((tokens_per_expert, scores))
         x = x.view(in_shape)
         if self.bias is not None:
             if self.args.return_bias:
@@ -429,12 +429,34 @@ class SoftMoE(moe.MoE):
         # Expert computation helper.
         self.experts = ParallelSoftMLP(args)
 
+    def dispatch(self, x, dispatch_weights):
+        # takes in input tokens and returns linearly-combined inputs to SoftMoE's slots.
+
+        # x: [sl, bs, hs]
+        # TODO: currently assumes same shape returned as input. we will need to handle total_slots < seqlen case
+        input_slots = x * dispatch_weights 
+
+        # input_slots: [sl, bs, hs]
+        return input_slots
+
+    def combine(self, x, combine_weights):
+        # takes in outputs from slots and returns a linear combination of slot outputs for each *token*.
+        
+        # x: [total_slots, bs, hs] # TODO: for now we assume total_slots = sl
+        output_tokens = x * combine_weights
+        
+        # output_tokens: [sl, bs, hs]
+        return output_tokens
+
     def forward(self, x):
         # NOTE: If we're going to cast the activations to lower precision
         # do it before we permute the tokens to save bandwidth.
         x = common.cast_if_autocast_enabled(x)
 
         # TODO: is it safe to do combine/dispatch on each rank locally? then do forward() logic as is typical?
+
+        # TODO: compute the l2 normalization used
+        # TODO: compute the balance / router statistics from paper's code release
         
         # Compute the expert scores and assignments.
         scores, expert_weights, top_experts = self.router(x) # TODO: return from my implemented router not yet matching this
