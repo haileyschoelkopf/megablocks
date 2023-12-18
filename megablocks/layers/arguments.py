@@ -23,7 +23,7 @@ class Arguments:
     # MoE arguments.
     moe_num_experts : int = 1
     moe_top_k : int = 1
-    moe_num_slots_per_expert: int = -1
+    moe_num_slots_per_expert: Optional[int] = None
     moe_capacity_factor : int = 1
     moe_normalize_expert_weights: Optional[Union[int, float]] = None
     moe_loss_weight : float = 0.1
@@ -70,6 +70,14 @@ class Arguments:
 
         if self.__getattribute__('grouped_mlp'):
             grouped_gemm.assert_grouped_gemm_is_available()
+
+        
+        if self.moe_num_slots_per_expert:
+            print("Warning: using moe_num_slots_per_expert, will ignore moe_top_k setting")
+
+            if self.moe_top_k > 1:
+                print("moe_top_k == 1 required for Soft MoE. Remove moe_num_slots_per_expert or set moe_top_k == 1.")
+                self.moe_top_k = 1
 
 
 def from_megatron(megatron_args):
